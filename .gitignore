@@ -1,2 +1,6 @@
 patch.sh
 gemini-scripts/
+
+# Local patch scripts
+/gemini-scripts/*.sh
+/patch.sh
