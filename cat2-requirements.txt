@@ -1,0 +1,2 @@
+textual>=0.89,<2
+tiktoken>=0.8,<1
