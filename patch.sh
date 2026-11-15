@@ -1,6 +1,6 @@
 mkdir -p gemini-scripts
 
-cat > gemini-scripts/001-add-textual-token-split.sh <<'SH'
+cat > gemini-scripts/002-english-step-wizard.sh <<'SH'
 #!/bin/zsh
 set -euo pipefail
 
@@ -15,365 +15,425 @@ from pathlib import Path
 
 target = Path(sys.argv[1])
 if not target.is_file():
-    raise SystemExit(f"対象ファイルがありません: {target}")
+    raise SystemExit(f"Target file not found: {target}")
 
 source = target.read_text(encoding="utf-8")
-if "class Cat2App(" in source:
-    raise SystemExit("Textual版の修正は適用済みです。")
+if "class WizardPage(" in source:
+    raise SystemExit("The wizard update has already been applied.")
 
 tree = ast.parse(source)
-main_nodes = [
+classes = [
     node for node in tree.body
-    if isinstance(node, ast.FunctionDef) and node.name == "main"
+    if isinstance(node, ast.ClassDef) and node.name == "Cat2App"
 ]
-if len(main_nodes) != 1:
-    raise SystemExit("main()を一意に特定できません。")
+if len(classes) != 1:
+    raise SystemExit("Could not uniquely locate Cat2App.")
 
-guard_nodes = [
-    node for node in tree.body
-    if isinstance(node, ast.If)
-    and ast.get_source_segment(source, node.test)
-    in ('__name__ == \'__main__\'', '__name__ == "__main__"')
-]
-if len(guard_nodes) != 1:
-    raise SystemExit("__main__の起動処理を一意に特定できません。")
-
-anchor = "    # 階層に関係なく node_modules ディレクトリを常に除外する"
-if source.count(anchor) != 1:
-    raise SystemExit("除外処理の追加位置を特定できません。")
-
-# 元コードの行番号を使い、下から起動処理とmain()を削除する。
-lines = source.splitlines(keepends=True)
-for node in sorted(
-    [main_nodes[0], guard_nodes[0]],
-    key=lambda node: node.lineno,
-    reverse=True,
+for required in (
+    "build_output_plan",
+    "write_output_plan",
 ):
-    del lines[node.lineno - 1:node.end_lineno]
+    if not any(
+        isinstance(node, ast.FunctionDef) and node.name == required
+        for node in tree.body
+    ):
+        raise SystemExit(f"Required function not found: {required}")
 
-source = "".join(lines)
-source = source.replace(
-    anchor,
-    '''    # 過去の生成物を入力として取り込まない。
-    if not is_dir and re.fullmatch(r"output\\.\\d{2,}\\.md", rel_path.name):
-        return True
-
-''' + anchor,
-    1,
-)
-
-addition = r'''
-
-# --- Textual UI / token-based output ---
-import tempfile
-from dataclasses import dataclass
-
-try:
-    import tiktoken
-    from textual import work
-    from textual.app import App, ComposeResult
-    from textual.containers import Horizontal, VerticalScroll
-    from textual.widgets import (
-        Button, Footer, Header, Input, Label, Select, TextArea
-    )
-except ImportError as exc:
-    raise SystemExit(
-        "依存パッケージが不足しています。\n"
-        "python3 -m pip install -r cat2-requirements.txt\n"
-        f"詳細: {exc}"
-    ) from exc
+replacement = r'''
+from textual.screen import Screen
+from textual.widgets import OptionList, Static
 
 
-# ツール用の初期値。Gemini公式のモデル上限ではない。
-ENGINE_PROFILES = {
-    "flash": ("Gemini Flash", 32000),
-    "thinking": ("Gemini Thinking", 32000),
-    "pro": ("Gemini Pro", 64000),
-}
+class WizardPage(Screen):
+    BINDINGS = [
+        ("escape", "back", "Back"),
+        ("ctrl+q", "app.quit", "Quit"),
+    ]
 
-# Geminiモデル指定と、計測用のOpenAIモデル指定は分離する。
-TOKENIZERS = [
-    ("gpt-4o / o200k_base", "model:gpt-4o"),
-    ("gpt-4 / cl100k_base", "model:gpt-4"),
-    ("encoding: o200k_base", "encoding:o200k_base"),
-    ("encoding: cl100k_base", "encoding:cl100k_base"),
-    ("encoding: p50k_base", "encoding:p50k_base"),
-]
+    def __init__(
+        self,
+        title,
+        description="",
+        choices=None,
+        selected=None,
+        input_value=None,
+        integer=False,
+        report=None,
+        busy=False,
+    ):
+        super().__init__()
+        self.question_title = title
+        self.description = description
+        self.choices = choices
+        self.selected = selected
+        self.input_value = input_value
+        self.integer = integer
+        self.report = report
+        self.busy = busy
 
-OUTPUT_PATTERN = re.compile(r"output\.\d{2,}\.md")
+    def compose(self) -> ComposeResult:
+        yield Header()
+        with VerticalScroll(id="wizard"):
+            yield Static(self.question_title, id="question", markup=False)
+            if self.description:
+                yield Static(
+                    self.description, id="description", markup=False
+                )
+            if self.report is not None:
+                yield TextArea(
+                    self.report,
+                    read_only=True,
+                    id="report",
+                )
+            if self.input_value is not None:
+                yield Input(
+                    value=self.input_value,
+                    type="integer" if self.integer else "text",
+                    id="answer",
+                )
+            if self.choices:
+                yield OptionList(
+                    *(label for label, value in self.choices),
+                    id="choices",
+                )
+            yield Static("", id="error", markup=False)
+        yield Footer()
 
+    def on_mount(self):
+        if self.choices:
+            options = self.query_one("#choices", OptionList)
+            values = [value for label, value in self.choices]
+            options.highlighted = (
+                values.index(self.selected)
+                if self.selected in values else 0
+            )
+            options.focus()
+        elif self.input_value is not None:
+            self.query_one("#answer", Input).focus()
 
-@dataclass(frozen=True)
-class OutputPlan:
-    directory: str
-    engine: str
-    tokenizer: str
-    encoding: str
-    limit: int
-    documents: tuple
-    counts: tuple
-    file_count: int
-
-
-def load_tokenizer(setting):
-    kind, name = setting.split(":", 1)
-    if kind == "model":
-        return tiktoken.encoding_for_model(name)
-    return tiktoken.get_encoding(name)
-
-
-def count_tokens(encoding, text):
-    # ソース中の特殊トークン風文字列も通常の文字列として扱う。
-    return len(encoding.encode(text, disallowed_special=()))
-
-
-def fenced_section(label, content):
-    label = label.replace("\r", "\\r").replace("\n", "\\n")
-    longest = max(
-        (len(m.group(0)) for m in re.finditer(r"`+", content)),
-        default=0,
-    )
-    fence = "`" * max(4, longest + 1)
-    separator = "" if content.endswith("\n") else "\n"
-    return f"{fence}{label}\n{content}{separator}{fence}\n\n"
-
-
-def split_section(label, content, fits):
-    """文字単位の分割で元データを保持し、完成したブロックを再計測する。"""
-    whole = fenced_section(label, content)
-    if fits(whole):
-        return [whole]
-
-    def divide(start, end):
-        piece_label = f"{label} [chars {start}:{end}]"
-        block = fenced_section(piece_label, content[start:end])
-        if fits(block):
-            return [block]
-        if end - start <= 1:
-            raise ValueError(
-                f"見出しを含めると上限に収まりません: {label}"
+    def on_option_list_option_selected(
+        self, event: OptionList.OptionSelected
+    ):
+        event.stop()
+        if self.choices and not self.busy:
+            self.app.accept_answer(
+                self.choices[event.option_index][1]
             )
 
-        midpoint = (start + end) // 2
-        # 巨大な1行以外は、できるだけ行境界で分割する。
-        newline = content.rfind("\n", start, midpoint)
-        if newline >= start + (end - start) // 4:
-            midpoint = newline + 1
-        return divide(start, midpoint) + divide(midpoint, end)
+    def on_input_submitted(self, event: Input.Submitted):
+        event.stop()
+        if not self.busy:
+            self.app.accept_answer(event.value)
 
-    return divide(0, len(content))
+    def action_back(self):
+        if not self.busy:
+            self.app.go_back()
 
-
-def build_output_plan(directory, engine, tokenizer, limit):
-    if limit < 1024:
-        raise ValueError("分割上限は1,024 tokens以上にしてください。")
-
-    target = Path(directory).expanduser().resolve()
-    if not target.is_dir():
-        raise ValueError(f"ディレクトリがありません: {target}")
-
-    encoding = load_tokenizer(tokenizer)
-    local_ignore = target / ".cat2ignore"
-    ignore_file = (
-        local_ignore if local_ignore.is_file() else Path(".cat2ignore")
-    )
-    rules = load_ignore_rules(ignore_file)
-    files = collect_files(target, rules)
-
-    if not files:
-        raise ValueError("対象のテキストファイルがありません。")
-
-    engine_label = ENGINE_PROFILES[engine][0]
-    header = (
-        "# cat2 export\n\n"
-        f"- Profile: {engine_label}\n"
-        f"- Tokenizer: {tokenizer}\n"
-        f"- Encoding: {encoding.name}\n"
-        f"- Limit: {limit} estimated tokens per file\n"
-        "- Counts are tiktoken estimates, not Gemini token counts.\n\n"
-    )
-
-    def fits(block):
-        return count_tokens(encoding, header + block) <= limit
-
-    sections = [
-        ("#file:tree", get_tree_output(target, ignore_rules=rules))
-    ]
-    sections.extend(files)
-
-    documents = []
-    current = header
-
-    for label, content in sections:
-        for block in split_section(label, content, fits):
-            candidate = current + block
-            if count_tokens(encoding, candidate) > limit:
-                if current == header:
-                    raise ValueError("単一ブロックが上限を超えています。")
-                documents.append(current)
-                current = header + block
-            else:
-                current = candidate
-
-    if current != header:
-        documents.append(current)
-
-    counts = tuple(count_tokens(encoding, doc) for doc in documents)
-    if not all(count <= limit for count in counts):
-        raise ValueError("最終出力のトークン上限チェックに失敗しました。")
-
-    return OutputPlan(
-        directory=str(target),
-        engine=engine,
-        tokenizer=tokenizer,
-        encoding=encoding.name,
-        limit=limit,
-        documents=tuple(documents),
-        counts=counts,
-        file_count=len(files),
-    )
-
-
-def write_output_plan(plan):
-    """全ファイルを一時保存後に配置し、余った旧出力を削除する。"""
-    destination = Path.cwd()
-    encoding = load_tokenizer(plan.tokenizer)
-
-    # 書き込み直前にも、実際の出力文字列を再計測する。
-    actual = tuple(
-        count_tokens(encoding, doc) for doc in plan.documents
-    )
-    if actual != plan.counts or any(n > plan.limit for n in actual):
-        raise ValueError("出力直前のトークン検証に失敗しました。")
-
-    names = [
-        f"output.{number:02d}.md"
-        for number in range(1, len(plan.documents) + 1)
-    ]
-
-    with tempfile.TemporaryDirectory(
-        prefix=".cat2-stage-", dir=destination
-    ) as temporary:
-        stage = Path(temporary)
-        for name, document in zip(names, plan.documents):
-            (stage / name).write_bytes(document.encode("utf-8"))
-
-        for name in names:
-            (stage / name).replace(destination / name)
-
-        expected = set(names)
-        for path in destination.iterdir():
-            if (
-                OUTPUT_PATTERN.fullmatch(path.name)
-                and path.name not in expected
-                and (path.is_file() or path.is_symlink())
-            ):
-                path.unlink()
-
-    return names
+    def show_error(self, message):
+        self.query_one("#error", Static).update(message)
 
 
 class Cat2App(App):
-    TITLE = "cat2 — Gemini向けトークン分割"
-    BINDINGS = [("ctrl+q", "quit", "終了")]
+    TITLE = "cat2 - Gemini Export Wizard"
+    BINDINGS = [("ctrl+q", "quit", "Quit")]
     CSS = """
     Screen { layout: vertical; }
-    #form { height: 1fr; padding: 1 2; }
-    Label { margin-top: 1; }
-    Input, Select { width: 100%; }
-    #buttons { height: 3; margin-top: 1; }
-    Button { margin-right: 1; }
-    #report { height: 14; margin-top: 1; }
+    #wizard {
+        width: 90%;
+        max-width: 110;
+        height: 1fr;
+        margin: 1 auto;
+        padding: 1 2;
+    }
+    #question {
+        text-style: bold;
+        margin-bottom: 1;
+    }
+    #description {
+        margin-bottom: 1;
+        color: $text-muted;
+    }
+    #answer {
+        width: 100%;
+        margin-top: 1;
+    }
+    #choices {
+        height: auto;
+        max-height: 16;
+        margin-top: 1;
+    }
+    #report {
+        height: 16;
+        margin-bottom: 1;
+    }
+    #error {
+        color: $error;
+        margin-top: 1;
+        height: auto;
+    }
     """
 
     def __init__(self, directory):
         super().__init__()
-        self.initial_directory = directory
+        self.directory = directory
+        self.engine = "flash"
+        self.tokenizer = "model:gpt-4o"
+        self.limit = ENGINE_PROFILES[self.engine][1]
         self.plan = None
+        self.stage = "directory"
+        self.page_started = False
 
-    def compose(self) -> ComposeResult:
-        yield Header()
-        with VerticalScroll(id="form"):
-            yield Label("対象ディレクトリ")
-            yield Input(value=self.initial_directory, id="directory")
-            yield Label("Gemini利用プロファイル")
-            yield Select(
-                [(label, key) for key, (label, _) in ENGINE_PROFILES.items()],
-                value="flash",
-                allow_blank=False,
-                id="engine",
-            )
-            yield Label("tiktoken計測モデル / encoding")
-            yield Select(
-                TOKENIZERS,
-                value="model:gpt-4o",
-                allow_blank=False,
-                id="tokenizer",
-            )
-            yield Label("1ファイルの上限（tiktoken推定tokens）")
-            yield Input(value="32000", type="integer", id="limit")
-            yield Label(
-                "Geminiの実トークン数とは異なります。"
-                "プロファイルの初期上限は変更可能です。"
-            )
-            with Horizontal(id="buttons"):
-                yield Button("計測・分割プレビュー", id="preview", variant="primary")
-                yield Button("ファイル出力", id="write", disabled=True)
-            yield TextArea(
-                "設定後に「計測・分割プレビュー」を実行してください。",
-                read_only=True,
-                id="report",
-            )
-        yield Footer()
+    def on_mount(self):
+        self.show_stage("directory")
 
-    def invalidate(self):
+    def display_page(self, page):
+        if self.page_started:
+            self.switch_screen(page)
+        else:
+            self.push_screen(page)
+            self.page_started = True
+
+    def show_stage(self, stage, report=None):
+        self.stage = stage
+
+        if stage == "directory":
+            page = WizardPage(
+                "1 / 5 - Target directory",
+                "Enter the directory to export, then press Enter.",
+                input_value=self.directory,
+            )
+
+        elif stage == "engine":
+            page = WizardPage(
+                "2 / 5 - Gemini profile",
+                "Use Up / Down to select. Press Enter to continue.\n"
+                "Profiles are local presets, not official model limits.",
+                choices=[
+                    (label, key)
+                    for key, (label, _) in ENGINE_PROFILES.items()
+                ],
+                selected=self.engine,
+            )
+
+        elif stage == "tokenizer":
+            page = WizardPage(
+                "3 / 5 - Token counting model",
+                "Use Up / Down to select. Press Enter to continue.\n"
+                "tiktoken counts are estimates, not Gemini token counts.",
+                choices=TOKENIZERS,
+                selected=self.tokenizer,
+            )
+
+        elif stage == "limit":
+            default = ENGINE_PROFILES[self.engine][1]
+            values = sorted({
+                8000, 16000, 32000, 64000, 128000,
+                default, self.limit,
+            })
+            page = WizardPage(
+                "4 / 5 - Tokens per output file",
+                "The limit includes export headers and Markdown fences.\n"
+                "Use Up / Down to select. Press Enter to continue.",
+                choices=[
+                    (
+                        f"{value:,} tokens"
+                        + (" (profile default)" if value == default else ""),
+                        value,
+                    )
+                    for value in values
+                ] + [("Custom limit...", "custom")],
+                selected=self.limit,
+            )
+
+        elif stage == "custom":
+            page = WizardPage(
+                "4 / 5 - Custom token limit",
+                "Enter at least 1,024 tokens, then press Enter.",
+                input_value=str(self.limit),
+                integer=True,
+            )
+
+        elif stage == "counting":
+            page = WizardPage(
+                "Counting and splitting...",
+                "Collecting files and measuring the final Markdown.\n"
+                "The first tokenizer load may download encoding data.\n"
+                "Please wait.",
+                busy=True,
+            )
+
+        elif stage == "review":
+            page = WizardPage(
+                "5 / 5 - Review and export",
+                "Review the estimates, then select an action.\n"
+                "Export replaces existing output.NN.md files "
+                "in the output directory.",
+                report=self.format_plan(),
+                choices=[
+                    ("Export files", "export"),
+                    ("Change token limit", "limit"),
+                    ("Start over", "restart"),
+                    ("Quit without exporting", "quit"),
+                ],
+                selected="export",
+            )
+
+        elif stage == "writing":
+            page = WizardPage(
+                "Exporting...",
+                "Rechecking token counts and writing output files.\n"
+                "Please wait.",
+                busy=True,
+            )
+
+        elif stage == "done":
+            page = WizardPage(
+                "Export complete",
+                "All output files passed the selected token limit.",
+                report=report,
+                choices=[
+                    ("Export another project", "restart"),
+                    ("Quit", "quit"),
+                ],
+                selected="quit",
+            )
+
+        elif stage == "error":
+            page = WizardPage(
+                "Operation failed",
+                "No successful export has been confirmed.",
+                report=report,
+                choices=[
+                    ("Return to token limit", "limit"),
+                    ("Start over", "restart"),
+                    ("Quit", "quit"),
+                ],
+                selected="limit",
+            )
+        else:
+            raise ValueError(f"Unknown wizard stage: {stage}")
+
+        self.display_page(page)
+
+    def accept_answer(self, value):
+        if self.stage == "directory":
+            directory = Path(value).expanduser().resolve()
+            if not directory.is_dir():
+                self.screen.show_error(
+                    f"Directory not found: {directory}"
+                )
+                return
+            self.directory = str(directory)
+            self.plan = None
+            self.show_stage("engine")
+
+        elif self.stage == "engine":
+            if value != self.engine:
+                self.engine = value
+                self.limit = ENGINE_PROFILES[value][1]
+            self.plan = None
+            self.show_stage("tokenizer")
+
+        elif self.stage == "tokenizer":
+            self.tokenizer = value
+            self.plan = None
+            self.show_stage("limit")
+
+        elif self.stage == "limit":
+            if value == "custom":
+                self.show_stage("custom")
+            else:
+                self.limit = value
+                self.start_preview()
+
+        elif self.stage == "custom":
+            try:
+                limit = int(value)
+                if limit < 1024:
+                    raise ValueError
+            except ValueError:
+                self.screen.show_error(
+                    "Enter an integer of at least 1,024."
+                )
+                return
+            self.limit = limit
+            self.start_preview()
+
+        elif self.stage == "review":
+            if value == "export":
+                if self.plan is None:
+                    self.show_stage(
+                        "error", "No preview is available. Please retry."
+                    )
+                    return
+                self.show_stage("writing")
+                self.export_worker(self.plan)
+            else:
+                self.navigate(value)
+
+        elif self.stage in ("done", "error"):
+            self.navigate(value)
+
+    def navigate(self, value):
+        if value == "quit":
+            self.exit()
+        elif value == "restart":
+            self.plan = None
+            self.show_stage("directory")
+        elif value == "limit":
+            self.plan = None
+            self.show_stage("limit")
+
+    def go_back(self):
+        previous = {
+            "engine": "directory",
+            "tokenizer": "engine",
+            "limit": "tokenizer",
+            "custom": "limit",
+            "review": "limit",
+            "error": "limit",
+        }
+        if self.stage in previous:
+            self.plan = None
+            self.show_stage(previous[self.stage])
+
+    def start_preview(self):
         self.plan = None
-        self.query_one("#write", Button).disabled = True
-
-    def on_input_changed(self, event: Input.Changed):
-        self.invalidate()
-
-    def on_select_changed(self, event: Select.Changed):
-        self.invalidate()
-        if event.select.id == "engine":
-            profile = ENGINE_PROFILES.get(event.value)
-            if profile:
-                self.query_one("#limit", Input).value = str(profile[1])
-
-    def set_busy(self, busy):
-        for selector in (
-            "#directory", "#engine", "#tokenizer", "#limit", "#preview"
-        ):
-            self.query_one(selector).disabled = busy
-        self.query_one("#write", Button).disabled = (
-            busy or self.plan is None
+        self.show_stage("counting")
+        self.preview_worker(
+            self.directory,
+            self.engine,
+            self.tokenizer,
+            self.limit,
         )
 
-    def show_report(self, text):
-        self.query_one("#report", TextArea).load_text(text)
-
-    def on_button_pressed(self, event: Button.Pressed):
-        if event.button.id == "preview":
-            try:
-                limit = int(self.query_one("#limit", Input).value)
-                directory = self.query_one("#directory", Input).value
-                engine = self.query_one("#engine", Select).value
-                tokenizer = self.query_one("#tokenizer", Select).value
-                if limit < 1024:
-                    raise ValueError("分割上限は1,024以上にしてください。")
-            except ValueError as exc:
-                self.show_report(str(exc))
-                return
-
-            self.invalidate()
-            self.set_busy(True)
-            self.show_report("ファイル収集・トークン計測・分割を実行中...")
-            self.preview_worker(directory, engine, tokenizer, limit)
-
-        elif event.button.id == "write" and self.plan is not None:
-            self.set_busy(True)
-            self.show_report("出力直前の再計測と書き込みを実行中...")
-            self.write_worker(self.plan)
+    def format_plan(self):
+        plan = self.plan
+        rows = [
+            f"Source: {plan.directory}",
+            f"Profile: {ENGINE_PROFILES[plan.engine][0]}",
+            f"Tokenizer: {plan.tokenizer}",
+            f"Encoding: {plan.encoding}",
+            f"Input files: {plan.file_count:,}",
+            f"Token limit: {plan.limit:,}",
+            f"Output files: {len(plan.documents):,}",
+            f"Output directory: {Path.cwd()}",
+            "",
+        ]
+        for number, (count, document) in enumerate(
+            zip(plan.counts, plan.documents), 1
+        ):
+            rows.append(
+                f"output.{number:02d}.md"
+                f"  {count:,} estimated tokens"
+                f"  {len(document.encode('utf-8')):,} bytes"
+            )
+        rows.extend([
+            "",
+            "Export uses the source snapshot collected during preview.",
+            "If source files change, run the preview again.",
+        ])
+        return "\n".join(rows)
 
     @work(thread=True, exclusive=True)
     def preview_worker(self, directory, engine, tokenizer, limit):
@@ -382,99 +442,77 @@ class Cat2App(App):
                 directory, engine, tokenizer, limit
             )
         except Exception as exc:
-            self.call_from_thread(self.finish_error, str(exc))
+            self.call_from_thread(
+                self.show_stage, "error", str(exc)
+            )
         else:
             self.call_from_thread(self.finish_preview, plan)
 
-    def finish_error(self, message):
-        self.show_report(f"エラー: {message}")
-        self.set_busy(False)
-
     def finish_preview(self, plan):
         self.plan = plan
-        rows = [
-            f"対象: {plan.directory}",
-            f"プロファイル: {ENGINE_PROFILES[plan.engine][0]}",
-            f"計測: {plan.tokenizer} → {plan.encoding}",
-            f"入力ファイル数: {plan.file_count}",
-            f"分割上限: {plan.limit:,} estimated tokens",
-            f"出力ファイル数: {len(plan.documents)}",
-            f"出力先: {Path.cwd()}",
-            "",
-        ]
-        for number, (count, document) in enumerate(
-            zip(plan.counts, plan.documents), 1
-        ):
-            rows.append(
-                f"output.{number:02d}.md: "
-                f"{count:,} tokens / "
-                f"{len(document.encode('utf-8')):,} bytes"
-            )
-        rows.extend([
-            "",
-            "既存のoutput.XX.mdはファイル出力時に置き換えます。",
-            "プレビューで収集した内容を出力します。",
-            "ソースを変更した場合は再プレビューしてください。",
-        ])
-        self.show_report("\n".join(rows))
-        self.set_busy(False)
+        self.show_stage("review")
 
     @work(thread=True, exclusive=True)
-    def write_worker(self, plan):
+    def export_worker(self, plan):
         try:
             names = write_output_plan(plan)
         except Exception as exc:
-            self.call_from_thread(self.finish_error, str(exc))
+            self.call_from_thread(
+                self.show_stage, "error", str(exc)
+            )
         else:
-            self.call_from_thread(self.finish_write, names)
-
-    def finish_write(self, names):
-        self.show_report(
-            f"{len(names)}ファイルを出力しました。\n\n"
-            + "\n".join(names)
-        )
-        self.plan = None
-        self.set_busy(False)
-
-
-def main():
-    if len(sys.argv) > 2:
-        print("Usage: cat2 [directory]", file=sys.stderr)
-        sys.exit(1)
-
-    directory = sys.argv[1] if len(sys.argv) == 2 else "."
-    Cat2App(directory).run()
-
-
-if __name__ == "__main__":
-    main()
+            report = (
+                f"Output directory: {Path.cwd()}\n"
+                f"Files created: {len(names):,}\n\n"
+                + "\n".join(names)
+            )
+            self.call_from_thread(
+                self.show_stage, "done", report
+            )
 '''
 
-updated = source.rstrip() + "\n\n" + addition.lstrip()
+node = classes[0]
+lines = source.splitlines(keepends=True)
+lines[node.lineno - 1:node.end_lineno] = [
+    replacement.strip() + "\n"
+]
+updated = "".join(lines)
+
+# UIに表示される既存のエラーメッセージも英語化する。
+translations = {
+    "分割上限は1,024 tokens以上にしてください。":
+        "The token limit must be at least 1,024.",
+    "ディレクトリがありません:":
+        "Directory not found:",
+    "対象のテキストファイルがありません。":
+        "No text files were found.",
+    "見出しを含めると上限に収まりません:":
+        "The section cannot fit within the token limit:",
+    "単一ブロックが上限を超えています。":
+        "A single block exceeds the token limit.",
+    "最終出力のトークン上限チェックに失敗しました。":
+        "Final output token validation failed.",
+    "出力直前のトークン検証に失敗しました。":
+        "Pre-export token validation failed.",
+    "依存パッケージが不足しています。":
+        "Required packages are missing.",
+    "詳細:":
+        "Details:",
+}
+for old, new in translations.items():
+    updated = updated.replace(old, new)
+
 ast.parse(updated, filename=str(target))
-
-requirements = Path("cat2-requirements.txt")
-if requirements.exists():
-    raise SystemExit(
-        "cat2-requirements.txtが既にあります。"
-        "上書きを避けるため処理を中止しました。"
-    )
-
 target.write_text(updated, encoding="utf-8")
-requirements.write_text(
-    "textual>=0.89,<2\n"
-    "tiktoken>=0.8,<1\n",
-    encoding="utf-8",
-)
 
-print(f"更新しました: {target}")
-print("追加しました: cat2-requirements.txt")
-print("Python構文チェックに成功しました。")
+print(f"Updated: {target}")
+print("Python syntax validation passed.")
+print("The Textual runtime has not been tested by this script.")
 PY
 
 git add .
-git commit -m 'Textual画面とトークン単位の分割出力を追加'
+git commit -m 'Textual画面を英語の一問一画面ウィザードに変更'
 SH
 
-chmod +x gemini-scripts/001-add-textual-token-split.sh
-./gemini-scripts/001-add-textual-token-split.sh
+chmod +x gemini-scripts/002-english-step-wizard.sh
+./gemini-scripts/002-english-step-wizard.sh
