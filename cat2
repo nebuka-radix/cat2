@@ -601,12 +601,15 @@ class Cat2App(App):
     TITLE = "cat2 - Gemini Export Wizard"
     BINDINGS = [("ctrl+q", "quit", "Quit")]
     CSS = """
-    Screen { layout: vertical; }
+    Screen {
+        layout: vertical;
+        align-horizontal: center;
+    }
     #wizard {
         width: 90%;
         max-width: 110;
         height: 1fr;
-        margin: 1 auto;
+        margin: 1 0;
         padding: 1 2;
     }
     #question {
@@ -635,6 +638,7 @@ class Cat2App(App):
         margin-top: 1;
         height: auto;
     }
+    
     """
 
     def __init__(self, directory):
