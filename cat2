@@ -605,11 +605,6 @@ def run_console_wizard(initial_directory):
     directory = str(directory_path)
 
     while True:
-        print()
-        print("cat2 - Gemini Export")
-        print("Use Up/Down and Enter to select. Press Ctrl+C to cancel.")
-        print("Profile limits are local presets, not official Gemini limits.")
-        print()
 
         directory = str(Path(directory).expanduser().resolve())
 
